@@ -1,0 +1,166 @@
+name: CI Kanban (Mission Control)
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+    paths:
+      - 'kanban.ruststash.net/**'
+      - '.github/workflows/ci-kanban.yaml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'kanban.ruststash.net/**'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ruststash/ruststash-kanban
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      sha_short: ${{ steps.vars.outputs.sha_short }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get short SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=staging-${{ steps.vars.outputs.sha_short }},enable=${{ github.ref == 'refs/heads/staging' }}
+            type=raw,value=prod-${{ steps.vars.outputs.sha_short }},enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./kanban.ruststash.net
+          file: ./kanban.ruststash.net/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+          build-args: |
+            GITHUB_TOKEN=${{ secrets.GITHUB_PAT }}
+            CACHEBUST=${{ github.run_number }}
+
+  update-gitops:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v4
+        with:
+          repository: Ruststash/ruststash-gitops
+          token: ${{ secrets.GITOPS_PAT }}
+          path: gitops
+
+      - name: Determine environment
+        id: env
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/staging" ]]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+            echo "values_file=values-staging.yaml" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]] || [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+            echo "values_file=values-production.yaml" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update image tag
+        if: steps.env.outputs.environment != ''
+        run: |
+          cd gitops/charts/kanban
+
+          # Determine the tag to use
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            TAG="${{ github.event.release.tag_name }}"
+          elif [[ "${{ steps.env.outputs.environment }}" == "staging" ]]; then
+            TAG="staging-${{ needs.build.outputs.sha_short }}"
+          else
+            TAG="prod-${{ needs.build.outputs.sha_short }}"
+          fi
+
+          # Update values file
+          sed -i "s/tag: .*/tag: \"${TAG}\"/" ${{ steps.env.outputs.values_file }}
+
+          echo "Updated image tag to: ${TAG}"
+
+      - name: Commit and push changes
+        if: steps.env.outputs.environment != ''
+        run: |
+          cd gitops
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add .
+          git diff --staged --quiet || git commit -m "Update kanban image to ${{ needs.build.outputs.sha_short }} (${{ steps.env.outputs.environment }})"
+          git push
+
+  notify:
+    needs: [build, update-gitops]
+    runs-on: ubuntu-latest
+    if: always() && github.event_name != 'pull_request'
+
+    steps:
+      - name: Deployment notification
+        run: |
+          if [[ "${{ needs.build.result }}" == "success" ]] && [[ "${{ needs.update-gitops.result }}" == "success" ]]; then
+            echo "✅ Mission Control deployment triggered successfully"
+            echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.sha_short }}"
+            echo "Environment: $(if [[ '${{ github.ref }}' == 'refs/heads/main' ]]; then echo 'production'; else echo 'staging'; fi)"
+            echo ""
+            echo "📋 Next steps:"
+            echo "- For staging: ArgoCD will auto-sync"
+            echo "- For production: Manual sync required at https://gitops.ruststash.net"
+          else
+            echo "❌ Deployment failed"
+            exit 1
+          fi

@@ -1,0 +1,100 @@
+name: CI - Crypto Service
+
+on:
+  push:
+    branches: [staging]
+    paths:
+      - 'crypto.ruststash.net/**'
+      - '.github/workflows/ci-crypto.yaml'
+  release:
+    types: [published]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/ruststash-crypto
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # For staging branch pushes
+            type=sha,prefix=staging-,enable=${{ github.ref == 'refs/heads/staging' }}
+            # For releases/tags (production)
+            type=semver,pattern=v{{version}},enable=${{ github.event_name == 'release' }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./crypto.ruststash.net
+          file: ./crypto.ruststash.net/docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  update-gitops:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v4
+        with:
+          repository: Ruststash/ruststash-gitops
+          token: ${{ secrets.GITOPS_PAT }}
+          path: gitops
+
+      - name: Setup yq
+        uses: mikefarah/yq@v4
+
+      - name: Determine environment and update values
+        run: |
+          cd gitops/charts/ruststash
+          TAG="${{ needs.build.outputs.image_tag }}"
+
+          if [[ "${{ github.ref }}" == "refs/heads/staging" ]]; then
+            echo "Updating staging values with tag: $TAG"
+            yq -i '.crypto.image.tag = "'$TAG'"' values-staging.yaml
+          elif [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "Updating production values with tag: $TAG"
+            yq -i '.crypto.image.tag = "'$TAG'"' values-production.yaml
+          fi
+
+      - name: Commit and push changes
+        run: |
+          cd gitops
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --staged --quiet || git commit -m "chore(crypto): update image tag to ${{ needs.build.outputs.image_tag }}
+
+          Triggered by: ${{ github.event_name }}
+          Source commit: ${{ github.sha }}
+          Workflow: ${{ github.workflow }}"
+          git push

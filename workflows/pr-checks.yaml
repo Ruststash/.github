@@ -1,0 +1,536 @@
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [staging, main]
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  NODE_VERSION: '20'
+  VAULT_ADDR: https://vault.ruststash.net
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 1: Detect Changes
+  # ═══════════════════════════════════════════════════════════════════════════
+  changes:
+    name: 📋 Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      api: ${{ steps.filter.outputs.api }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+      crypto: ${{ steps.filter.outputs.crypto }}
+      agents: ${{ steps.filter.outputs.agents }}
+      any_service: ${{ steps.filter.outputs.api == 'true' || steps.filter.outputs.frontend == 'true' || steps.filter.outputs.crypto == 'true' || steps.filter.outputs.agents == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            api:
+              - 'api.ruststash.net/**'
+            frontend:
+              - 'vue.ruststash.net/**'
+            crypto:
+              - 'crypto.ruststash.net/**'
+            agents:
+              - 'agents.ruststash.net/**'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 2: Import Vault Secrets
+  # ═══════════════════════════════════════════════════════════════════════════
+  vault-secrets:
+    name: 🔐 Import Vault Secrets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # Required for JWT auth with Vault
+    outputs:
+      # Export non-sensitive env vars (sensitive ones stay in Vault)
+      db_host: ${{ steps.secrets.outputs.DB_HOST }}
+      redis_url: ${{ steps.secrets.outputs.REDIS_URL }}
+    steps:
+      - name: Import secrets from Vault
+        id: secrets
+        uses: hashicorp/vault-action@v2
+        with:
+          url: ${{ env.VAULT_ADDR }}
+          method: jwt
+          role: ci-staging
+          jwtGithubAudience: https://github.com/Ruststash
+          secrets: |
+            ruststash/data/staging/api DB_HOST | DB_HOST ;
+            ruststash/data/staging/api DB_PORT | DB_PORT ;
+            ruststash/data/staging/api DB_NAME | DB_NAME ;
+            ruststash/data/staging/api DB_USER | DB_USER ;
+            ruststash/data/staging/api DB_PASSWORD | DB_PASSWORD ;
+            ruststash/data/staging/api REDIS_URL | REDIS_URL ;
+            ruststash/data/staging/api JWT_SECRET | JWT_SECRET ;
+            ruststash/data/staging/api STEAM_API_KEY | STEAM_API_KEY ;
+            ruststash/data/staging/crypto PLISIO_SECRET | PLISIO_SECRET
+
+      - name: Verify Vault connection
+        run: |
+          echo "✅ Successfully connected to Vault"
+          echo "📦 Loaded secrets for staging environment"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 3: Security Scans (Run First, Fail Fast)
+  # ═══════════════════════════════════════════════════════════════════════════
+  secrets-scan:
+    name: 🔐 Secrets Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependency-review:
+    name: 🔍 Dependency Review
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          deny-licenses: GPL-3.0, AGPL-3.0
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 4: Pre-Build Checks (Lint + Test)
+  # ═══════════════════════════════════════════════════════════════════════════
+  
+  # ─────────────────────────────────────────────────────────────────────────────
+  # API Service
+  # ─────────────────────────────────────────────────────────────────────────────
+  api-lint-test:
+    name: 🧪 API / Lint & Test
+    needs: [changes]
+    if: needs.changes.outputs.api == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api.ruststash.net
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: api.ruststash.net/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Lint
+        run: npm run lint --if-present
+
+      - name: Run Tests
+        run: npm test
+
+      - name: Security Audit
+        run: npm audit --audit-level=high
+
+  api-docker-build:
+    name: 🐳 API / Docker Build
+    needs: [changes, api-lint-test, secrets-scan]
+    if: needs.changes.outputs.api == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/ruststash-api
+          tags: |
+            type=sha,prefix=pr-${{ github.event.pull_request.number }}-
+
+      - name: Build Docker image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./api.ruststash.net
+          file: ./api.ruststash.net/Dockerfile
+          target: production
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.tags }}
+          format: 'sarif'
+          output: 'trivy-api.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-api.sarif'
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Frontend Service
+  # ─────────────────────────────────────────────────────────────────────────────
+  frontend-lint-test:
+    name: 🧪 Frontend / Lint & Test
+    needs: [changes]
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vue.ruststash.net
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: vue.ruststash.net/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Lint
+        run: npm run lint --if-present
+
+      - name: Run Type Check
+        run: npm run type-check --if-present || npx vue-tsc --noEmit --skipLibCheck || true
+
+      - name: Run Tests
+        run: npm test
+
+  frontend-docker-build:
+    name: 🐳 Frontend / Docker Build
+    needs: [changes, frontend-lint-test, secrets-scan]
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/ruststash-frontend
+          tags: |
+            type=sha,prefix=pr-${{ github.event.pull_request.number }}-
+
+      - name: Build Docker image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./vue.ruststash.net
+          file: ./vue.ruststash.net/Dockerfile
+          target: production
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            VITE_ENV=staging
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Crypto Service
+  # ─────────────────────────────────────────────────────────────────────────────
+  crypto-lint-test:
+    name: 🧪 Crypto / Lint & Test
+    needs: [changes]
+    if: needs.changes.outputs.crypto == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crypto.ruststash.net
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: crypto.ruststash.net/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Lint
+        run: npm run lint --if-present
+
+      - name: Run Tests
+        run: npm test
+
+      - name: Security Audit
+        run: npm audit --audit-level=high
+
+  crypto-docker-build:
+    name: 🐳 Crypto / Docker Build
+    needs: [changes, crypto-lint-test, secrets-scan]
+    if: needs.changes.outputs.crypto == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/ruststash-crypto
+          tags: |
+            type=sha,prefix=pr-${{ github.event.pull_request.number }}-
+
+      - name: Build Docker image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./crypto.ruststash.net
+          file: ./crypto.ruststash.net/Dockerfile
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Agents Service
+  # ─────────────────────────────────────────────────────────────────────────────
+  agents-lint-test:
+    name: 🧪 Agents / Lint & Test
+    needs: [changes]
+    if: needs.changes.outputs.agents == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agents.ruststash.net
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: agents.ruststash.net/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Lint
+        run: npm run lint --if-present
+
+      - name: Run Tests
+        run: npm test --if-present
+
+  agents-docker-build:
+    name: 🐳 Agents / Docker Build
+    needs: [changes, agents-lint-test, secrets-scan]
+    if: needs.changes.outputs.agents == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/ruststash-agents
+          tags: |
+            type=sha,prefix=pr-${{ github.event.pull_request.number }}-
+
+      - name: Build Docker image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./agents.ruststash.net
+          file: ./agents.ruststash.net/Dockerfile
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 5: Integration Tests (with Vault secrets)
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Uncomment when you add integration tests that need database/redis
+  #
+  # api-integration-test:
+  #   name: 🔗 API / Integration Tests
+  #   needs: [changes, vault-secrets, api-lint-test]
+  #   if: needs.changes.outputs.api == 'true'
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     contents: read
+  #     id-token: write
+  #   services:
+  #     postgres:
+  #       image: postgres:15
+  #       env:
+  #         POSTGRES_USER: ruststash
+  #         POSTGRES_PASSWORD: test
+  #         POSTGRES_DB: ruststash_test
+  #       ports:
+  #         - 5432:5432
+  #       options: >-
+  #         --health-cmd pg_isready
+  #         --health-interval 10s
+  #         --health-timeout 5s
+  #         --health-retries 5
+  #     redis:
+  #       image: redis:7
+  #       ports:
+  #         - 6379:6379
+  #   defaults:
+  #     run:
+  #       working-directory: api.ruststash.net
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     
+  #     - name: Import secrets from Vault
+  #       uses: hashicorp/vault-action@v2
+  #       with:
+  #         url: ${{ env.VAULT_ADDR }}
+  #         method: jwt
+  #         role: ci-staging
+  #         jwtGithubAudience: https://github.com/Ruststash
+  #         secrets: |
+  #           ruststash/data/staging/api JWT_SECRET | JWT_SECRET ;
+  #           ruststash/data/staging/api STEAM_API_KEY | STEAM_API_KEY
+  #     
+  #     - name: Setup Node.js
+  #       uses: actions/setup-node@v4
+  #       with:
+  #         node-version: ${{ env.NODE_VERSION }}
+  #         cache: 'npm'
+  #         cache-dependency-path: api.ruststash.net/package-lock.json
+  #
+  #     - name: Install dependencies
+  #       run: npm ci
+  #
+  #     - name: Run Integration Tests
+  #       run: npm run test:integration
+  #       env:
+  #         DB_HOST: localhost
+  #         DB_PORT: 5432
+  #         DB_NAME: ruststash_test
+  #         DB_USER: ruststash
+  #         DB_PASSWORD: test
+  #         REDIS_URL: redis://localhost:6379
+  #         JWT_SECRET: ${{ env.JWT_SECRET }}
+  #         STEAM_API_KEY: ${{ env.STEAM_API_KEY }}
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 6: Final Status Check
+  # ═══════════════════════════════════════════════════════════════════════════
+  pr-status:
+    name: ✅ PR Status Check
+    needs:
+      - changes
+      - vault-secrets
+      - secrets-scan
+      - dependency-review
+      - api-lint-test
+      - api-docker-build
+      - frontend-lint-test
+      - frontend-docker-build
+      - crypto-lint-test
+      - crypto-docker-build
+      - agents-lint-test
+      - agents-docker-build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all required jobs
+        run: |
+          echo "Checking job results..."
+          
+          # Vault secrets import
+          if [[ "${{ needs.vault-secrets.result }}" == "failure" ]]; then
+            echo "❌ Vault secrets import failed - blocking merge"
+            exit 1
+          fi
+          
+          # Security checks are always required
+          if [[ "${{ needs.secrets-scan.result }}" == "failure" ]]; then
+            echo "❌ Secrets scan failed - blocking merge"
+            exit 1
+          fi
+          
+          if [[ "${{ needs.dependency-review.result }}" == "failure" ]]; then
+            echo "❌ Dependency review failed - blocking merge"
+            exit 1
+          fi
+          
+          # Check service-specific jobs only if that service changed
+          if [[ "${{ needs.changes.outputs.api }}" == "true" ]]; then
+            if [[ "${{ needs.api-lint-test.result }}" == "failure" ]]; then
+              echo "❌ API lint/test failed"
+              exit 1
+            fi
+            if [[ "${{ needs.api-docker-build.result }}" == "failure" ]]; then
+              echo "❌ API Docker build failed"
+              exit 1
+            fi
+          fi
+          
+          if [[ "${{ needs.changes.outputs.frontend }}" == "true" ]]; then
+            if [[ "${{ needs.frontend-lint-test.result }}" == "failure" ]]; then
+              echo "❌ Frontend lint/test failed"
+              exit 1
+            fi
+            if [[ "${{ needs.frontend-docker-build.result }}" == "failure" ]]; then
+              echo "❌ Frontend Docker build failed"
+              exit 1
+            fi
+          fi
+          
+          if [[ "${{ needs.changes.outputs.crypto }}" == "true" ]]; then
+            if [[ "${{ needs.crypto-lint-test.result }}" == "failure" ]]; then
+              echo "❌ Crypto lint/test failed"
+              exit 1
+            fi
+            if [[ "${{ needs.crypto-docker-build.result }}" == "failure" ]]; then
+              echo "❌ Crypto Docker build failed"
+              exit 1
+            fi
+          fi
+          
+          if [[ "${{ needs.changes.outputs.agents }}" == "true" ]]; then
+            if [[ "${{ needs.agents-lint-test.result }}" == "failure" ]]; then
+              echo "❌ Agents lint/test failed"
+              exit 1
+            fi
+            if [[ "${{ needs.agents-docker-build.result }}" == "failure" ]]; then
+              echo "❌ Agents Docker build failed"
+              exit 1
+            fi
+          fi
+          
+          echo "✅ All required checks passed!"

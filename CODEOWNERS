@@ -1,0 +1,59 @@
+# RustStash Code Owners
+# These owners will be requested for review when someone opens a PR
+
+# Default - require review for all changes
+* @skylerush
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Services
+# ─────────────────────────────────────────────────────────────────────────────
+
+# API Service
+/api.ruststash.net/ @skylerush
+
+# Frontend
+/vue.ruststash.net/ @skylerush
+
+# Crypto Service (security critical)
+/crypto.ruststash.net/ @skylerush
+
+# Agents Service
+/agents.ruststash.net/ @skylerush
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Critical Paths (require extra attention)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Financial operations
+/api.ruststash.net/src/lib/promos/ @skylerush
+/api.ruststash.net/src/lib/economy.ts @skylerush
+
+# Authentication
+/api.ruststash.net/src/authql/ @skylerush
+/api.ruststash.net/src/lib/password.ts @skylerush
+
+# Crypto wallets (extremely critical)
+/crypto.ruststash.net/src/vault/ @skylerush
+/crypto.ruststash.net/src/modules/webhooks/ @skylerush
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Infrastructure
+# ─────────────────────────────────────────────────────────────────────────────
+
+# CI/CD workflows
+/.github/ @skylerush
+
+# GitOps (if in same repo)
+/ruststash-gitops/ @skylerush
+
+# Docker configurations
+**/Dockerfile @skylerush
+**/docker-compose*.yml @skylerush
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Documentation
+# ─────────────────────────────────────────────────────────────────────────────
+
+/docs/ @skylerush
+*.md @skylerush
+/skills/ @skylerush

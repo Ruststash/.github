@@ -1,0 +1,255 @@
+name: PR Checks (Reusable)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REUSABLE WORKFLOW - Called by individual repos
+# Store in: ruststash-gitops/.github/workflows/pr-checks.reusable.yml
+# Call with: uses: Ruststash/ruststash-gitops/.github/workflows/pr-checks.reusable.yml@main
+# ═══════════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: 'Service name (api, frontend, crypto, agents)'
+        required: true
+        type: string
+      node_version:
+        description: 'Node.js version'
+        required: false
+        type: string
+        default: '20'
+      docker_context:
+        description: 'Docker build context path'
+        required: false
+        type: string
+        default: '.'
+      docker_file:
+        description: 'Dockerfile path'
+        required: false
+        type: string
+        default: './Dockerfile'
+      docker_target:
+        description: 'Docker build target'
+        required: false
+        type: string
+        default: 'production'
+      run_lint:
+        description: 'Run lint step'
+        required: false
+        type: boolean
+        default: true
+      run_tests:
+        description: 'Run tests step'
+        required: false
+        type: boolean
+        default: true
+      run_typecheck:
+        description: 'Run TypeScript type check'
+        required: false
+        type: boolean
+        default: false
+      run_audit:
+        description: 'Run npm audit'
+        required: false
+        type: boolean
+        default: true
+      vault_secrets_path:
+        description: 'Vault secrets path (e.g., ruststash/data/staging/api)'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      GITOPS_PAT:
+        description: 'PAT for GitOps repo access'
+        required: false
+
+env:
+  REGISTRY: ghcr.io
+  VAULT_ADDR: https://vault.ruststash.net
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 1: Import Vault Secrets (if configured)
+  # ═══════════════════════════════════════════════════════════════════════════
+  vault-secrets:
+    name: 🔐 Import Vault Secrets
+    runs-on: ubuntu-latest
+    if: inputs.vault_secrets_path != ''
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Import secrets from Vault
+        uses: hashicorp/vault-action@v2
+        with:
+          url: ${{ env.VAULT_ADDR }}
+          method: jwt
+          role: ci-staging
+          jwtGithubAudience: https://github.com/Ruststash
+          exportEnv: true
+          secrets: |
+            ${{ inputs.vault_secrets_path }} DB_HOST | DB_HOST ;
+            ${{ inputs.vault_secrets_path }} REDIS_URL | REDIS_URL ;
+            ${{ inputs.vault_secrets_path }} JWT_SECRET | JWT_SECRET
+
+      - name: Verify Vault connection
+        run: |
+          echo "✅ Successfully connected to Vault"
+          echo "📦 Loaded secrets for ${{ inputs.service_name }}"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 2: Security Scans
+  # ═══════════════════════════════════════════════════════════════════════════
+  secrets-scan:
+    name: 🔐 Secrets Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  dependency-review:
+    name: 🔍 Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          deny-licenses: GPL-3.0, AGPL-3.0
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 3: Lint & Test
+  # ═══════════════════════════════════════════════════════════════════════════
+  lint-test:
+    name: 🧪 Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Lint
+        if: inputs.run_lint
+        run: npm run lint --if-present
+
+      - name: Run Type Check
+        if: inputs.run_typecheck
+        run: npm run type-check --if-present || npx vue-tsc --noEmit --skipLibCheck || true
+
+      - name: Run Tests
+        if: inputs.run_tests
+        run: npm test --if-present
+
+      - name: Security Audit
+        if: inputs.run_audit
+        run: npm audit --audit-level=high || true
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 4: Docker Build
+  # ═══════════════════════════════════════════════════════════════════════════
+  docker-build:
+    name: 🐳 Docker Build
+    needs: [lint-test, secrets-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/ruststash-${{ inputs.service_name }}
+          tags: |
+            type=sha,prefix=pr-${{ github.event.pull_request.number || github.run_number }}-
+
+      - name: Build Docker image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.docker_context }}
+          file: ${{ inputs.docker_file }}
+          target: ${{ inputs.docker_target }}
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.tags }}
+          format: 'table'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 5: CodeQL Security Analysis
+  # ═══════════════════════════════════════════════════════════════════════════
+  codeql:
+    name: 🛡️ CodeQL Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript-typescript"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 6: Status Check
+  # ═══════════════════════════════════════════════════════════════════════════
+  status:
+    name: ✅ PR Status
+    needs: [secrets-scan, dependency-review, lint-test, docker-build, codeql]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          echo "📋 PR Check Results for ${{ inputs.service_name }}"
+          echo "================================"
+          
+          if [[ "${{ needs.secrets-scan.result }}" == "failure" ]]; then
+            echo "❌ Secrets scan failed"
+            exit 1
+          fi
+          
+          if [[ "${{ needs.lint-test.result }}" == "failure" ]]; then
+            echo "❌ Lint/Test failed"
+            exit 1
+          fi
+          
+          if [[ "${{ needs.docker-build.result }}" == "failure" ]]; then
+            echo "❌ Docker build failed"
+            exit 1
+          fi
+          
+          echo "✅ All checks passed for ${{ inputs.service_name }}!"
